@@ -1684,7 +1684,9 @@ async def process_chat_response(
 
                     choices = response_data.get("choices", [])
                     if choices and choices[0].get("message", {}).get("content"):
-                        content = response_data["choices"][0]["message"]["content"]
+                        message = response_data["choices"][0]["message"]
+                        content = message.get("content")
+                        thinking_blocks = message.get("thinking_blocks")
 
                         if content:
                             await event_emitter(
@@ -1707,14 +1709,20 @@ async def process_chat_response(
                                 }
                             )
 
-                            # Save message in the database
+                            # Save message in the database with thinking_blocks
+                            message_data = {
+                                "role": "assistant",
+                                "content": content,
+                            }
+                            
+                            # Preserve thinking_blocks if present (needed for Bedrock with reasoning_effort)
+                            if thinking_blocks:
+                                message_data["thinking_blocks"] = thinking_blocks
+                            
                             Chats.upsert_message_to_chat_by_id_and_message_id(
                                 metadata["chat_id"],
                                 metadata["message_id"],
-                                {
-                                    "role": "assistant",
-                                    "content": content,
-                                },
+                                message_data,
                             )
 
                             # Send a webhook notification if the user is not active
@@ -1969,15 +1977,22 @@ async def process_chat_response(
                 messages = []
 
                 temp_blocks = []
+                thinking_blocks = []  # Collect reasoning blocks for thinking_blocks
+                
                 for idx, block in enumerate(content_blocks):
                     if block["type"] == "tool_calls":
-                        messages.append(
-                            {
-                                "role": "assistant",
-                                "content": serialize_content_blocks(temp_blocks, raw),
-                                "tool_calls": block.get("content"),
-                            }
-                        )
+                        # Build message with accumulated blocks
+                        message = {
+                            "role": "assistant",
+                            "content": serialize_content_blocks(temp_blocks, raw),
+                            "tool_calls": block.get("content"),
+                        }
+                        
+                        # Add thinking_blocks if any reasoning blocks were collected
+                        if thinking_blocks:
+                            message["thinking_blocks"] = thinking_blocks
+                            
+                        messages.append(message)
 
                         results = block.get("results", [])
 
@@ -1990,18 +2005,34 @@ async def process_chat_response(
                                 }
                             )
                         temp_blocks = []
+                        thinking_blocks = []  # Reset for next message
+                    elif block["type"] == "reasoning":
+                        # Preserve reasoning blocks as thinking_blocks
+                        thinking_block = {
+                            "type": "thinking",
+                            "thinking": block.get("content", ""),
+                        }
+                        # Include signature if available (for Bedrock)
+                        if "signature" in block:
+                            thinking_block["signature"] = block["signature"]
+                        thinking_blocks.append(thinking_block)
+                        temp_blocks.append(block)
                     else:
                         temp_blocks.append(block)
 
                 if temp_blocks:
                     content = serialize_content_blocks(temp_blocks, raw)
                     if content:
-                        messages.append(
-                            {
-                                "role": "assistant",
-                                "content": content,
-                            }
-                        )
+                        message = {
+                            "role": "assistant",
+                            "content": content,
+                        }
+                        
+                        # Add thinking_blocks if any reasoning blocks were collected
+                        if thinking_blocks:
+                            message["thinking_blocks"] = thinking_blocks
+                            
+                        messages.append(message)
 
                 return messages
 
@@ -2351,6 +2382,16 @@ async def process_chat_response(
 
                                     delta = choices[0].get("delta", {})
                                     delta_tool_calls = delta.get("tool_calls", None)
+                                    
+                                    # Capture thinking_blocks if present in delta (for Bedrock with reasoning_effort)
+                                    delta_thinking_blocks = delta.get("thinking_blocks", None)
+                                    if delta_thinking_blocks:
+                                        # Store thinking_blocks in the last reasoning block if it exists
+                                        if content_blocks and content_blocks[-1].get("type") == "reasoning":
+                                            # Add/update signature information
+                                            for thinking_block in delta_thinking_blocks:
+                                                if "signature" in thinking_block:
+                                                    content_blocks[-1]["signature"] = thinking_block["signature"]
 
                                     if delta_tool_calls:
                                         for delta_tool_call in delta_tool_calls:
@@ -2926,17 +2967,35 @@ async def process_chat_response(
                         )
 
                         try:
+                            # Extract thinking_blocks from reasoning blocks in content_blocks
+                            thinking_blocks = []
+                            for block in content_blocks:
+                                if block.get("type") == "reasoning":
+                                    thinking_block = {
+                                        "type": "thinking",
+                                        "thinking": block.get("content", ""),
+                                    }
+                                    if "signature" in block:
+                                        thinking_block["signature"] = block["signature"]
+                                    thinking_blocks.append(thinking_block)
+                            
+                            assistant_message = {
+                                "role": "assistant",
+                                "content": serialize_content_blocks(
+                                    content_blocks, raw=True
+                                ),
+                            }
+                            
+                            # Include thinking_blocks if any reasoning was present
+                            if thinking_blocks:
+                                assistant_message["thinking_blocks"] = thinking_blocks
+                            
                             new_form_data = {
                                 "model": model_id,
                                 "stream": True,
                                 "messages": [
                                     *form_data["messages"],
-                                    {
-                                        "role": "assistant",
-                                        "content": serialize_content_blocks(
-                                            content_blocks, raw=True
-                                        ),
-                                    },
+                                    assistant_message,
                                 ],
                             }
 
@@ -2962,13 +3021,31 @@ async def process_chat_response(
                 }
 
                 if not ENABLE_REALTIME_CHAT_SAVE:
-                    # Save message in the database
+                    # Extract thinking_blocks from reasoning blocks in content_blocks
+                    thinking_blocks = []
+                    for block in content_blocks:
+                        if block.get("type") == "reasoning":
+                            thinking_block = {
+                                "type": "thinking",
+                                "thinking": block.get("content", ""),
+                            }
+                            if "signature" in block:
+                                thinking_block["signature"] = block["signature"]
+                            thinking_blocks.append(thinking_block)
+                    
+                    # Save message in the database with thinking_blocks
+                    message_data = {
+                        "content": serialize_content_blocks(content_blocks),
+                    }
+                    
+                    # Preserve thinking_blocks if any reasoning was present
+                    if thinking_blocks:
+                        message_data["thinking_blocks"] = thinking_blocks
+                    
                     Chats.upsert_message_to_chat_by_id_and_message_id(
                         metadata["chat_id"],
                         metadata["message_id"],
-                        {
-                            "content": serialize_content_blocks(content_blocks),
-                        },
+                        message_data,
                     )
 
                 # Send a webhook notification if the user is not active
